@@ -1,13 +1,16 @@
 # Maintainer: Zach9113 <130371506+Zach9113@users.noreply.github.com>
 pkgname=xone-control
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
-pkgdesc="Desktop manager and idle auto-shutoff daemon for Xbox Wireless Adapters using the Linux xone driver"
+pkgdesc="Desktop manager and idle auto-shutoff daemon for Xbox Wireless Controllers (xone dongle + Bluetooth)"
 arch=('any')
 url="https://github.com/Zach9113/xone-control"
 license=('GPL-3.0-or-later')
 depends=('python' 'pyside6')
-optdepends=('xone-dkms: Linux kernel driver for Xbox Wireless Adapters')
+optdepends=(
+    'xone-dkms: Linux kernel driver for Xbox Wireless Adapters'
+    'bluez-utils: bluetoothctl for disconnecting idle Bluetooth Xbox controllers'
+)
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Zach9113/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 

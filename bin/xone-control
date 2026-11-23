@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-xone-control — Xbox Wireless Controller Manager GUI for Linux xone.
+xone-control — Xbox Wireless Controller Manager GUI for Linux
+(supports both `xone` USB wireless adapters and Bluetooth Xbox controllers).
 License: GPL-3.0-or-later
 """
 
 import glob
 import json
 import os
+import subprocess
 import sys
 
 from PySide6.QtCore import Qt, QTimer
@@ -43,6 +45,16 @@ DEFAULT_CONFIG = {
     "led_mode": 1,
 }
 
+XBOX_BT_PIDS = {
+    "02e0",
+    "02fd",
+    "0b05",
+    "0b0a",
+    "0b13",
+    "0b20",
+    "0b22",
+}
+
 STYLESHEET = """
 QMainWindow, QWidget#Root {
     background-color: #11161d;
@@ -73,6 +85,11 @@ QLabel.BigStatus {
 QLabel.SubStatus {
     color: #8b9bb4;
     font-size: 13px;
+}
+QLabel.HintLabel {
+    color: #8b9bb4;
+    font-size: 12px;
+    font-style: italic;
 }
 QLabel.BadgeGreen {
     background-color: #133923;
@@ -200,7 +217,7 @@ QCheckBox {
 }
 """
 
-BATTERY_MAP = {
+BATTERY_LEVEL_MAP = {
     "Full": ("100%", "BadgeGreen"),
     "High": ("~75%", "BadgeGreen"),
     "Normal": ("~50%", "BadgeYellow"),
@@ -257,11 +274,96 @@ def format_duration(seconds):
     return f"{m}m {s:02d}s"
 
 
+def battery_badge_for_supply(supply_dir):
+    if not supply_dir or not os.path.isdir(supply_dir):
+        return ("Battery: --", "BadgeGray")
+    cap_str = read_sysfs(os.path.join(supply_dir, "capacity"), "")
+    if cap_str.isdigit():
+        pct = int(cap_str)
+        if pct >= 65:
+            style = "BadgeGreen"
+        elif pct >= 30:
+            style = "BadgeYellow"
+        else:
+            style = "BadgeRed"
+        return (f"Battery: {pct}%", style)
+
+    level = read_sysfs(os.path.join(supply_dir, "capacity_level"), "")
+    if level in BATTERY_LEVEL_MAP:
+        pct_str, style = BATTERY_LEVEL_MAP[level]
+        return (f"Battery: {pct_str}", style)
+    return ("Battery: --", "BadgeGray")
+
+
+def find_bt_battery_dir(mac):
+    mac_l = mac.lower()
+    direct = f"/sys/class/power_supply/hid-{mac_l}-battery"
+    if os.path.isdir(direct):
+        return direct
+    for ps in glob.glob("/sys/class/power_supply/*"):
+        if mac_l in os.path.basename(ps).lower():
+            return ps
+    return None
+
+
+def discover_controllers(dongle_dir):
+    found = []
+
+    if dongle_dir:
+        for client_dir in sorted(glob.glob(os.path.join(dongle_dir, "gip*/gip*.*"))):
+            client_name = os.path.basename(client_dir)
+            slot_str = client_name.split(".")[0][3:]
+            fw_ver = read_sysfs(os.path.join(client_dir, "firmware_version"), "")
+            fw_suffix = f"  •  FW {fw_ver}" if fw_ver and fw_ver != "0.0.0.0" else ""
+            batt_dir = os.path.join(client_dir, "power_supply", client_name)
+            found.append(
+                {
+                    "id": f"xone:{slot_str}",
+                    "transport": "xone",
+                    "slot": slot_str,
+                    "title": f"Xbox Controller (Dongle Slot {slot_str}){fw_suffix}",
+                    "batt_dir": batt_dir,
+                    "off_label": "Turn Off",
+                }
+            )
+
+    seen_macs = set()
+    for ev_sys in sorted(glob.glob("/sys/class/input/event*")):
+        dev_dir = os.path.join(ev_sys, "device")
+        if read_sysfs(os.path.join(dev_dir, "id/bustype")).lower() != "0005":
+            continue
+        if read_sysfs(os.path.join(dev_dir, "id/vendor")).lower() != "045e":
+            continue
+        product = read_sysfs(os.path.join(dev_dir, "id/product")).lower()
+        name = read_sysfs(os.path.join(dev_dir, "name"), "Xbox Wireless Controller")
+        if product not in XBOX_BT_PIDS and "xbox" not in name.lower():
+            continue
+        abs_caps = read_sysfs(os.path.join(dev_dir, "capabilities/abs"), "0")
+        if not abs_caps or abs_caps == "0":
+            continue
+        mac = read_sysfs(os.path.join(dev_dir, "uniq")).upper()
+        if not mac or mac in seen_macs:
+            continue
+        seen_macs.add(mac)
+        found.append(
+            {
+                "id": f"bt:{mac}",
+                "transport": "bluetooth",
+                "mac": mac,
+                "title": f"Xbox Controller (Bluetooth)",
+                "batt_dir": find_bt_battery_dir(mac),
+                "off_label": "Disconnect",
+            }
+        )
+
+    return found
+
+
 class ControllerRow(QFrame):
-    def __init__(self, slot_str, on_poweroff):
+    def __init__(self, ctrl_id, on_poweroff):
         super().__init__()
         self.setProperty("class", "SlotRow")
-        self.slot_str = slot_str
+        self.ctrl_id = ctrl_id
 
         v = QVBoxLayout(self)
         v.setContentsMargins(12, 10, 12, 10)
@@ -286,11 +388,11 @@ class ControllerRow(QFrame):
 
         self.off_btn = QPushButton("Turn Off")
         self.off_btn.setObjectName("SmallDangerBtn")
-        self.off_btn.clicked.connect(lambda: on_poweroff(slot_str))
+        self.off_btn.clicked.connect(lambda: on_poweroff(ctrl_id))
         bottom.addWidget(self.off_btn)
         v.addLayout(bottom)
 
-    def update_info(self, title_text, batt_text, badge_class, idle_text, show_individual_off):
+    def update_info(self, title_text, batt_text, badge_class, idle_text, off_label, show_off):
         self.title_lbl.setText(title_text)
         self.batt_badge.setText(batt_text)
         if self.batt_badge.property("class") != badge_class:
@@ -298,17 +400,19 @@ class ControllerRow(QFrame):
             self.batt_badge.style().unpolish(self.batt_badge)
             self.batt_badge.style().polish(self.batt_badge)
         self.idle_lbl.setText(idle_text)
-        self.off_btn.setVisible(show_individual_off)
+        self.off_btn.setText(off_label)
+        self.off_btn.setVisible(show_off)
 
 
 class XoneControlWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Xbox Wireless Controller Manager")
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(520)
         self.cfg = load_config()
         self._updating_ui = False
-        self._slot_rows = {}
+        self._ctrl_rows = {}
+        self._latest_controllers = {}
 
         root = QWidget()
         root.setObjectName("Root")
@@ -319,7 +423,7 @@ class XoneControlWindow(QMainWindow):
 
         # Header
         header_row = QHBoxLayout()
-        title = QLabel("Xbox Wireless Adapter & Controller")
+        title = QLabel("Xbox Wireless Controller Manager")
         title_font = QFont()
         title_font.setPointSize(14)
         title_font.setBold(True)
@@ -327,7 +431,7 @@ class XoneControlWindow(QMainWindow):
         header_row.addWidget(title)
         header_row.addStretch()
 
-        self.dongle_badge = QLabel("Dongle: Checking...")
+        self.dongle_badge = QLabel("Checking...")
         self.dongle_badge.setProperty("class", "BadgeGray")
         header_row.addWidget(self.dongle_badge)
         layout.addLayout(header_row)
@@ -363,7 +467,7 @@ class XoneControlWindow(QMainWindow):
 
         self.poweroff_btn = QPushButton("Turn Off Controller Now")
         self.poweroff_btn.setObjectName("DangerBtn")
-        self.poweroff_btn.clicked.connect(lambda: self.poweroff_slot("-1"))
+        self.poweroff_btn.clicked.connect(self.poweroff_all)
         btn_row.addWidget(self.poweroff_btn)
         s_layout.addLayout(btn_row)
 
@@ -422,16 +526,22 @@ class XoneControlWindow(QMainWindow):
 
         layout.addWidget(idle_card)
 
-        # Card 3: Xbox Guide Button LED
+        # Card 3: Xbox Guide Button LED (xone dongle only)
         led_card = QFrame()
         led_card.setProperty("class", "Card")
         l_layout = QVBoxLayout(led_card)
         l_layout.setContentsMargins(16, 14, 16, 14)
         l_layout.setSpacing(10)
 
-        sec3 = QLabel("XBOX GUIDE BUTTON LED")
+        sec3 = QLabel("XBOX GUIDE BUTTON LED (XONE DONGLE)")
         sec3.setProperty("class", "SectionTitle")
         l_layout.addWidget(sec3)
+
+        self.led_hint = QLabel("LED brightness & mode require an Xbox Wireless Adapter (xone). Not supported over Bluetooth.")
+        self.led_hint.setProperty("class", "HintLabel")
+        self.led_hint.setWordWrap(True)
+        self.led_hint.setVisible(False)
+        l_layout.addWidget(self.led_hint)
 
         b_row = QHBoxLayout()
         b_row.addWidget(QLabel("Brightness:"))
@@ -534,51 +644,91 @@ class XoneControlWindow(QMainWindow):
         write_sysfs(p_path, "0" if cur == "1" else "1")
         self.refresh_status()
 
-    def poweroff_slot(self, slot_val):
-        dongle_dir = find_dongle_dir()
-        if not dongle_dir:
+    def poweroff_one(self, ctrl_id):
+        ctrl = self._latest_controllers.get(ctrl_id)
+        if not ctrl:
             return
-        write_sysfs(os.path.join(dongle_dir, "poweroff"), str(slot_val))
+        if ctrl["transport"] == "xone":
+            dongle_dir = find_dongle_dir()
+            if dongle_dir:
+                write_sysfs(os.path.join(dongle_dir, "poweroff"), str(ctrl["slot"]))
+        elif ctrl["transport"] == "bluetooth":
+            try:
+                subprocess.Popen(
+                    ["bluetoothctl", "disconnect", ctrl["mac"]],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
         self.refresh_status()
 
-    def _clear_slot_rows(self, keep_slots):
-        for slot_str in list(self._slot_rows.keys()):
-            if slot_str not in keep_slots:
-                row = self._slot_rows.pop(slot_str)
+    def poweroff_all(self):
+        dongle_dir = find_dongle_dir()
+        has_xone = any(c["transport"] == "xone" for c in self._latest_controllers.values())
+        if dongle_dir and has_xone:
+            write_sysfs(os.path.join(dongle_dir, "poweroff"), "-1")
+        for ctrl in self._latest_controllers.values():
+            if ctrl["transport"] == "bluetooth":
+                try:
+                    subprocess.Popen(
+                        ["bluetoothctl", "disconnect", ctrl["mac"]],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                except Exception:
+                    pass
+        self.refresh_status()
+
+    def _clear_ctrl_rows(self, keep_ids):
+        for cid in list(self._ctrl_rows.keys()):
+            if cid not in keep_ids:
+                row = self._ctrl_rows.pop(cid)
                 self.slots_container.removeWidget(row)
                 row.deleteLater()
 
     def refresh_status(self):
         dongle_dir = find_dongle_dir()
-        if not dongle_dir:
-            self.dongle_badge.setText("Dongle: Not Found")
-            self.set_badge_style(self.dongle_badge, "BadgeGray")
-            self.pair_btn.setEnabled(False)
-            self.poweroff_btn.setEnabled(False)
-            self._clear_slot_rows(set())
-            self.empty_title.setText("Xbox Wireless Adapter Disconnected")
-            self.empty_title.setVisible(True)
-            self.empty_sub.setText("Plug in your Xbox Wireless Adapter to manage controllers.")
-            self.empty_sub.setVisible(True)
-            return
+        controllers = discover_controllers(dongle_dir)
+        self._latest_controllers = {c["id"]: c for c in controllers}
 
-        self.pair_btn.setEnabled(True)
-        pairing = read_sysfs(os.path.join(dongle_dir, "pairing"), "0") == "1"
-        if pairing:
-            self.dongle_badge.setText("Dongle: Pairing Active")
-            self.set_badge_style(self.dongle_badge, "BadgeBlue")
-            self.pair_btn.setText("Stop Pairing Mode")
+        has_bt = any(c["transport"] == "bluetooth" for c in controllers)
+        has_dongle = dongle_dir is not None
+
+        if has_dongle:
+            self.pair_btn.setVisible(True)
+            self.pair_btn.setEnabled(True)
+            self.led_slider.setEnabled(True)
+            self.mode_combo.setEnabled(True)
+            self.led_hint.setVisible(False)
+            pairing = read_sysfs(os.path.join(dongle_dir, "pairing"), "0") == "1"
+            if pairing:
+                self.dongle_badge.setText("Dongle: Pairing Active")
+                self.set_badge_style(self.dongle_badge, "BadgeBlue")
+                self.pair_btn.setText("Stop Pairing Mode")
+            else:
+                self.dongle_badge.setText("Dongle: Ready")
+                self.set_badge_style(self.dongle_badge, "BadgeGreen")
+                self.pair_btn.setText("Start Dongle Pairing (60s)")
         else:
-            self.dongle_badge.setText("Dongle: Ready")
-            self.set_badge_style(self.dongle_badge, "BadgeGreen")
-            self.pair_btn.setText("Start Dongle Pairing (60s)")
+            self.pair_btn.setVisible(False)
+            self.led_slider.setEnabled(False)
+            self.mode_combo.setEnabled(False)
+            self.led_hint.setVisible(True)
+            if has_bt:
+                self.dongle_badge.setText("Bluetooth Active")
+                self.set_badge_style(self.dongle_badge, "BadgeBlue")
+            else:
+                self.dongle_badge.setText("Bluetooth Ready")
+                self.set_badge_style(self.dongle_badge, "BadgeGray")
 
-        client_dirs = sorted(glob.glob(os.path.join(dongle_dir, "gip*/gip*.*")))
-        if not client_dirs:
-            self._clear_slot_rows(set())
+        if not controllers:
+            self._clear_ctrl_rows(set())
             self.empty_title.setText("No Controller Connected")
             self.empty_title.setVisible(True)
-            self.empty_sub.setText("Press the Xbox button on your controller to connect.")
+            self.empty_sub.setText(
+                "Press the Xbox button on your controller to connect via dongle or Bluetooth."
+            )
             self.empty_sub.setVisible(True)
             self.poweroff_btn.setEnabled(False)
             self.poweroff_btn.setText("Turn Off Controller Now")
@@ -587,57 +737,51 @@ class XoneControlWindow(QMainWindow):
         self.empty_title.setVisible(False)
         self.empty_sub.setVisible(False)
         self.poweroff_btn.setEnabled(True)
-        multi = len(client_dirs) > 1
-        self.poweroff_btn.setText(
-            "Turn Off All Controllers" if multi else "Turn Off Controller Now"
-        )
+        multi = len(controllers) > 1
+        if multi:
+            self.poweroff_btn.setText("Turn Off / Disconnect All")
+        elif controllers[0]["transport"] == "bluetooth":
+            self.poweroff_btn.setText("Disconnect Controller Now")
+        else:
+            self.poweroff_btn.setText("Turn Off Controller Now")
 
-        daemon_slots = {}
+        daemon_ctrls = {}
         try:
             with open(STATE_PATH, "r", encoding="utf-8") as f:
-                daemon_slots = json.load(f).get("slots", {})
+                daemon_ctrls = json.load(f).get("controllers", {})
         except Exception:
             pass
 
-        active_slots = set()
-        for client_dir in client_dirs:
-            client_name = os.path.basename(client_dir)
-            slot_str = client_name.split(".")[0][3:]
-            active_slots.add(slot_str)
-
-            if slot_str not in self._slot_rows:
-                row = ControllerRow(slot_str, self.poweroff_slot)
-                self._slot_rows[slot_str] = row
+        active_ids = set()
+        for ctrl in controllers:
+            cid = ctrl["id"]
+            active_ids.add(cid)
+            if cid not in self._ctrl_rows:
+                row = ControllerRow(cid, self.poweroff_one)
+                self._ctrl_rows[cid] = row
                 self.slots_container.addWidget(row)
 
-            batt_level = read_sysfs(
-                os.path.join(client_dir, "power_supply", client_name, "capacity_level"),
-                "Normal",
-            )
-            fw_ver = read_sysfs(os.path.join(client_dir, "firmware_version"), "")
-            fw_suffix = f"  •  FW {fw_ver}" if fw_ver and fw_ver != "0.0.0.0" else ""
-
-            pct_str, badge_style = BATTERY_MAP.get(batt_level, (batt_level, "BadgeGray"))
-
+            batt_text, badge_style = battery_badge_for_supply(ctrl["batt_dir"])
             idle_text = "Idle timer active"
-            slot_info = daemon_slots.get(slot_str)
-            if slot_info:
-                idle_s = slot_info.get("idle_seconds", 0)
-                rem_s = slot_info.get("remaining_seconds")
+            st_info = daemon_ctrls.get(cid)
+            if st_info:
+                idle_s = st_info.get("idle_seconds", 0)
+                rem_s = st_info.get("remaining_seconds")
                 if rem_s is not None:
                     idle_text = f"Idle for {format_duration(idle_s)}  •  Auto-off in {format_duration(rem_s)}"
                 else:
                     idle_text = f"Idle for {format_duration(idle_s)}  •  Auto-off disabled"
 
-            self._slot_rows[slot_str].update_info(
-                f"Xbox Wireless Controller (Slot {slot_str}){fw_suffix}",
-                f"Battery: {pct_str}",
+            self._ctrl_rows[cid].update_info(
+                ctrl["title"],
+                batt_text,
                 badge_style,
                 idle_text,
+                ctrl["off_label"],
                 multi,
             )
 
-        self._clear_slot_rows(active_slots)
+        self._clear_ctrl_rows(active_ids)
 
 
 def main():

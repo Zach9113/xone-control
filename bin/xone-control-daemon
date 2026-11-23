@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-xone-control-daemon — Background idle auto-shutoff & LED manager for Linux xone wireless controllers.
+xone-control-daemon — Background idle auto-shutoff & LED manager for Xbox Wireless Controllers
+(supports both Linux `xone` USB wireless dongles and Bluetooth Xbox controllers via BlueZ).
 License: GPL-3.0-or-later
 """
 
@@ -9,6 +10,7 @@ import json
 import os
 import select
 import struct
+import subprocess
 import time
 
 CONFIG_DIR = os.path.join(
@@ -28,6 +30,17 @@ DEFAULT_CONFIG = {
     "led_mode": 1,
 }
 
+# Known Microsoft Xbox Bluetooth PIDs
+XBOX_BT_PIDS = {
+    "02e0",  # Xbox One S (BT)
+    "02fd",  # Xbox One S (BT newer firmware)
+    "0b05",  # Xbox Elite Series 2 (BT)
+    "0b0a",  # Xbox Adaptive Controller (BT)
+    "0b13",  # Xbox Series X|S (BT)
+    "0b20",  # Xbox Wireless Controller (BLE)
+    "0b22",  # Xbox Elite Series 2 (BLE)
+}
+
 # struct input_event on 64-bit Linux: timeval (q, q), type (H), code (H), value (i)
 INPUT_EVENT_STRUCT = struct.Struct("qqHHi")
 
@@ -37,6 +50,14 @@ EV_ABS = 0x03
 # Deadzone thresholds so slight stick drift doesn't reset the idle timer
 STICK_DEADZONE_DELTA = 1800
 TRIGGER_DEADZONE_DELTA = 35
+
+
+def read_text(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return default
 
 
 def load_config():
@@ -63,10 +84,10 @@ def find_dongle_dir():
     return matches[0] if matches else None
 
 
-def find_controllers(dongle_dir):
-    if not dongle_dir:
-        return {}
+def find_xone_controllers(dongle_dir):
     controllers = {}
+    if not dongle_dir:
+        return controllers
     for gip_dir in sorted(glob.glob(os.path.join(dongle_dir, "gip*"))):
         base = os.path.basename(gip_dir)
         if not base[3:].isdigit():
@@ -87,17 +108,56 @@ def find_controllers(dongle_dir):
                 ev_dev = candidate
 
         led_dir = os.path.join(client_dir, "leds", f"{client_name}:white:status")
-        batt_dir = os.path.join(client_dir, "power_supply", client_name)
-
-        controllers[idx] = {
+        cid = f"xone:{idx}"
+        controllers[cid] = {
+            "id": cid,
+            "transport": "xone",
             "slot": idx,
-            "gip_name": base,
-            "client_name": client_name,
-            "client_dir": client_dir,
+            "dongle_dir": dongle_dir,
             "event_dev": ev_dev,
             "led_dir": led_dir if os.path.isdir(led_dir) else None,
-            "batt_dir": batt_dir if os.path.isdir(batt_dir) else None,
         }
+    return controllers
+
+
+def find_bt_controllers():
+    controllers = {}
+    for ev_sys in sorted(glob.glob("/sys/class/input/event*")):
+        ev_name = os.path.basename(ev_sys)
+        dev_dir = os.path.join(ev_sys, "device")
+        bustype = read_text(os.path.join(dev_dir, "id/bustype")).lower()
+        if bustype != "0005":
+            continue
+        vendor = read_text(os.path.join(dev_dir, "id/vendor")).lower()
+        if vendor != "045e":
+            continue
+        product = read_text(os.path.join(dev_dir, "id/product")).lower()
+        name = read_text(os.path.join(dev_dir, "name"))
+        if product not in XBOX_BT_PIDS and "xbox" not in name.lower():
+            continue
+
+        # Skip non-gamepad subdevices (e.g. consumer control / keyboard)
+        abs_caps = read_text(os.path.join(dev_dir, "capabilities/abs"), "0").strip()
+        if not abs_caps or abs_caps == "0":
+            continue
+
+        mac = read_text(os.path.join(dev_dir, "uniq")).upper()
+        if not mac:
+            continue
+
+        ev_dev = f"/dev/input/{ev_name}"
+        if not os.path.exists(ev_dev):
+            continue
+
+        cid = f"bt:{mac}"
+        if cid not in controllers:
+            controllers[cid] = {
+                "id": cid,
+                "transport": "bluetooth",
+                "mac": mac,
+                "event_dev": ev_dev,
+                "led_dir": None,
+            }
     return controllers
 
 
@@ -114,15 +174,33 @@ def apply_led(ctrl, brightness, mode):
         pass
 
 
-def poweroff_slot(dongle_dir, slot):
-    if not dongle_dir:
-        return False
-    try:
-        with open(os.path.join(dongle_dir, "poweroff"), "w", encoding="utf-8") as f:
-            f.write(str(int(slot)))
-        return True
-    except Exception:
-        return False
+def poweroff_controller(ctrl):
+    if ctrl["transport"] == "xone":
+        dongle_dir = ctrl.get("dongle_dir")
+        if not dongle_dir:
+            return False
+        try:
+            with open(os.path.join(dongle_dir, "poweroff"), "w", encoding="utf-8") as f:
+                f.write(str(int(ctrl["slot"])))
+            return True
+        except Exception:
+            return False
+    elif ctrl["transport"] == "bluetooth":
+        mac = ctrl.get("mac")
+        if not mac:
+            return False
+        try:
+            res = subprocess.run(
+                ["bluetoothctl", "disconnect", mac],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+    return False
 
 
 def main():
@@ -141,26 +219,27 @@ def main():
             if mtime != last_cfg_mtime:
                 cfg = load_config()
                 last_cfg_mtime = mtime
-                for slot_info in tracked.values():
-                    slot_info["led_applied"] = False
+                for info in tracked.values():
+                    info["led_applied"] = False
         except Exception:
             pass
 
         dongle_dir = find_dongle_dir()
-        controllers = find_controllers(dongle_dir)
+        controllers = find_xone_controllers(dongle_dir)
+        controllers.update(find_bt_controllers())
 
-        for slot in list(tracked.keys()):
-            if slot not in controllers or tracked[slot]["event_dev"] != controllers[slot]["event_dev"]:
-                fd = tracked[slot].get("fd")
+        for cid in list(tracked.keys()):
+            if cid not in controllers or tracked[cid]["event_dev"] != controllers[cid]["event_dev"]:
+                fd = tracked[cid].get("fd")
                 if fd is not None:
                     try:
                         os.close(fd)
                     except Exception:
                         pass
-                del tracked[slot]
+                del tracked[cid]
 
-        for slot, ctrl in controllers.items():
-            if slot not in tracked:
+        for cid, ctrl in controllers.items():
+            if cid not in tracked:
                 fd = None
                 ev_dev = ctrl.get("event_dev")
                 if ev_dev:
@@ -168,30 +247,30 @@ def main():
                         fd = os.open(ev_dev, os.O_RDONLY | os.O_NONBLOCK)
                     except Exception:
                         fd = None
-                tracked[slot] = {
+                tracked[cid] = {
                     "fd": fd,
                     "event_dev": ev_dev,
                     "last_active": now,
                     "axes": {},
                     "led_applied": False,
                 }
-            if not tracked[slot]["led_applied"] and ctrl.get("led_dir"):
+            if not tracked[cid]["led_applied"] and ctrl.get("led_dir"):
                 apply_led(ctrl, cfg.get("led_brightness", 20), cfg.get("led_mode", 1))
-                tracked[slot]["led_applied"] = True
+                tracked[cid]["led_applied"] = True
 
-        fd_to_slot = {info["fd"]: slot for slot, info in tracked.items() if info["fd"] is not None}
-        if fd_to_slot:
+        fd_to_cid = {info["fd"]: cid for cid, info in tracked.items() if info["fd"] is not None}
+        if fd_to_cid:
             try:
-                rlist, _, _ = select.select(list(fd_to_slot.keys()), [], [], 1.0)
+                rlist, _, _ = select.select(list(fd_to_cid.keys()), [], [], 1.0)
             except Exception:
                 rlist = []
 
             now = time.time()
             for fd in rlist:
-                slot = fd_to_slot.get(fd)
-                if slot is None or slot not in tracked:
+                cid = fd_to_cid.get(fd)
+                if cid is None or cid not in tracked:
                     continue
-                t_info = tracked[slot]
+                t_info = tracked[cid]
                 try:
                     data = os.read(fd, INPUT_EVENT_STRUCT.size * 64)
                 except BlockingIOError:
@@ -233,22 +312,22 @@ def main():
         timeout_sec = max(1, int(cfg.get("idle_timeout_minutes", 15))) * 60
         idle_enabled = bool(cfg.get("idle_enabled", True))
 
-        state_slots = {}
-        for slot, t_info in list(tracked.items()):
+        state_controllers = {}
+        for cid, t_info in list(tracked.items()):
             idle_sec = max(0, int(now - t_info["last_active"]))
             rem_sec = max(0, timeout_sec - idle_sec) if idle_enabled else None
-            state_slots[str(slot)] = {
+            state_controllers[cid] = {
                 "idle_seconds": idle_sec,
                 "remaining_seconds": rem_sec,
             }
-            if idle_enabled and idle_sec >= timeout_sec:
-                if poweroff_slot(dongle_dir, slot):
+            if idle_enabled and idle_sec >= timeout_sec and cid in controllers:
+                if poweroff_controller(controllers[cid]):
                     t_info["last_active"] = now
 
         try:
             tmp_state = STATE_PATH + ".tmp"
             with open(tmp_state, "w", encoding="utf-8") as f:
-                json.dump({"updated": now, "slots": state_slots}, f)
+                json.dump({"updated": now, "controllers": state_controllers}, f)
             os.replace(tmp_state, STATE_PATH)
         except Exception:
             pass
