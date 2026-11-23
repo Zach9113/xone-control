@@ -2,6 +2,10 @@
 
 A lightweight Linux desktop manager and background idle auto-shutoff daemon for **Xbox Wireless Adapters** running the [`xone`](https://github.com/dlundqvist/xone) kernel driver.
 
+> [!IMPORTANT]
+> **Requires the [`xone`](https://github.com/dlundqvist/xone) Linux kernel driver.**
+> This is a companion app — it does **not** include the driver itself, and it will **not** work with Bluetooth (`xpadneo`) or wired-only `xpad`. You must already have `xone` (`xone-dongle` + `xone-gip-gamepad`) installed and working with your Xbox Wireless Adapter.
+
 ## Features
 
 - **Automatic Idle Power-Off:** Monitors controller input (`/dev/input/event*` with stick-drift deadzone filtering) and automatically powers off inactive controllers via `xone`'s sysfs interface after a configurable timeout (default: 15 minutes).
