@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pkg.tar.*
+pkg/
+src/
+.DS_Store

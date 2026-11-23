@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""
+xone-control — Xbox Wireless Controller Manager GUI for Linux xone.
+License: GPL-3.0-or-later
+"""
+
+import glob
+import json
+import os
+import sys
+
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "xone-control",
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+STATE_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+    "xone-control-state.json",
+)
+
+DEFAULT_CONFIG = {
+    "idle_enabled": True,
+    "idle_timeout_minutes": 15,
+    "led_brightness": 20,
+    "led_mode": 1,
+}
+
+STYLESHEET = """
+QMainWindow, QWidget#Root {
+    background-color: #11161d;
+    color: #e6edf3;
+    font-family: "Inter", "Noto Sans", sans-serif;
+}
+QFrame.Card {
+    background-color: #1a212b;
+    border: 1px solid #2a3444;
+    border-radius: 10px;
+}
+QFrame.SlotRow {
+    background-color: #141a22;
+    border: 1px solid #242e3d;
+    border-radius: 8px;
+}
+QLabel.SectionTitle {
+    color: #9baec8;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+}
+QLabel.BigStatus {
+    color: #ffffff;
+    font-size: 15px;
+    font-weight: 700;
+}
+QLabel.SubStatus {
+    color: #8b9bb4;
+    font-size: 13px;
+}
+QLabel.BadgeGreen {
+    background-color: #133923;
+    color: #3fb950;
+    border: 1px solid #238636;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 700;
+    font-size: 12px;
+}
+QLabel.BadgeGray {
+    background-color: #21262d;
+    color: #8b949e;
+    border: 1px solid #30363d;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 700;
+    font-size: 12px;
+}
+QLabel.BadgeBlue {
+    background-color: #0d2a4a;
+    color: #58a6ff;
+    border: 1px solid #1f6feb;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 700;
+    font-size: 12px;
+}
+QLabel.BadgeYellow {
+    background-color: #3a2e0f;
+    color: #e3b341;
+    border: 1px solid #9e6a03;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 700;
+    font-size: 12px;
+}
+QLabel.BadgeRed {
+    background-color: #3d1a1e;
+    color: #ff7b72;
+    border: 1px solid #da3633;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-weight: 700;
+    font-size: 12px;
+}
+QPushButton {
+    background-color: #212832;
+    color: #e6edf3;
+    border: 1px solid #354152;
+    border-radius: 7px;
+    padding: 8px 14px;
+    font-weight: 600;
+    font-size: 13px;
+}
+QPushButton:hover {
+    background-color: #2c3543;
+    border-color: #4b5a70;
+}
+QPushButton:disabled {
+    background-color: #161b22;
+    color: #484f58;
+    border-color: #21262d;
+}
+QPushButton#GreenBtn {
+    background-color: #107c10;
+    border: 1px solid #2ea043;
+    color: #ffffff;
+}
+QPushButton#GreenBtn:hover {
+    background-color: #159615;
+}
+QPushButton#DangerBtn {
+    background-color: #3d1a1e;
+    border: 1px solid #da3633;
+    color: #ff7b72;
+}
+QPushButton#DangerBtn:hover {
+    background-color: #582026;
+}
+QPushButton#SmallDangerBtn {
+    background-color: #3d1a1e;
+    border: 1px solid #da3633;
+    color: #ff7b72;
+    padding: 4px 10px;
+    font-size: 12px;
+}
+QPushButton#SmallDangerBtn:hover {
+    background-color: #582026;
+}
+QPushButton#PresetBtn {
+    padding: 5px 10px;
+    font-size: 12px;
+}
+QSlider::groove:horizontal {
+    height: 6px;
+    background: #2a3444;
+    border-radius: 3px;
+}
+QSlider::sub-page:horizontal {
+    background: #2ea043;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #e6edf3;
+    border: 2px solid #2ea043;
+    width: 16px;
+    height: 16px;
+    margin: -6px 0;
+    border-radius: 9px;
+}
+QSpinBox, QComboBox {
+    background-color: #11161d;
+    color: #e6edf3;
+    border: 1px solid #354152;
+    border-radius: 6px;
+    padding: 5px 10px;
+    font-size: 13px;
+    font-weight: 600;
+}
+QCheckBox {
+    font-size: 14px;
+    font-weight: 600;
+    spacing: 8px;
+}
+"""
+
+BATTERY_MAP = {
+    "Full": ("100%", "BadgeGreen"),
+    "High": ("~75%", "BadgeGreen"),
+    "Normal": ("~50%", "BadgeYellow"),
+    "Low": ("~20%", "BadgeRed"),
+    "Critical": ("~5%", "BadgeRed"),
+}
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            cfg = dict(DEFAULT_CONFIG)
+            cfg.update(data)
+            return cfg
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def find_dongle_dir():
+    matches = sorted(glob.glob("/sys/bus/usb/drivers/xone-dongle/*:1.0"))
+    return matches[0] if matches else None
+
+
+def read_sysfs(path, default=""):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def write_sysfs(path, value):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(str(value))
+        return True
+    except Exception:
+        return False
+
+
+def format_duration(seconds):
+    if seconds is None:
+        return "Disabled"
+    m, s = divmod(max(0, int(seconds)), 60)
+    return f"{m}m {s:02d}s"
+
+
+class ControllerRow(QFrame):
+    def __init__(self, slot_str, on_poweroff):
+        super().__init__()
+        self.setProperty("class", "SlotRow")
+        self.slot_str = slot_str
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(6)
+
+        top = QHBoxLayout()
+        self.title_lbl = QLabel()
+        self.title_lbl.setProperty("class", "BigStatus")
+        top.addWidget(self.title_lbl)
+        top.addStretch()
+
+        self.batt_badge = QLabel("Battery: --")
+        self.batt_badge.setProperty("class", "BadgeGray")
+        top.addWidget(self.batt_badge)
+        v.addLayout(top)
+
+        bottom = QHBoxLayout()
+        self.idle_lbl = QLabel("Idle timer active")
+        self.idle_lbl.setProperty("class", "SubStatus")
+        bottom.addWidget(self.idle_lbl)
+        bottom.addStretch()
+
+        self.off_btn = QPushButton("Turn Off")
+        self.off_btn.setObjectName("SmallDangerBtn")
+        self.off_btn.clicked.connect(lambda: on_poweroff(slot_str))
+        bottom.addWidget(self.off_btn)
+        v.addLayout(bottom)
+
+    def update_info(self, title_text, batt_text, badge_class, idle_text, show_individual_off):
+        self.title_lbl.setText(title_text)
+        self.batt_badge.setText(batt_text)
+        if self.batt_badge.property("class") != badge_class:
+            self.batt_badge.setProperty("class", badge_class)
+            self.batt_badge.style().unpolish(self.batt_badge)
+            self.batt_badge.style().polish(self.batt_badge)
+        self.idle_lbl.setText(idle_text)
+        self.off_btn.setVisible(show_individual_off)
+
+
+class XoneControlWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Xbox Wireless Controller Manager")
+        self.setMinimumWidth(500)
+        self.cfg = load_config()
+        self._updating_ui = False
+        self._slot_rows = {}
+
+        root = QWidget()
+        root.setObjectName("Root")
+        self.setCentralWidget(root)
+        layout = QVBoxLayout(root)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+
+        # Header
+        header_row = QHBoxLayout()
+        title = QLabel("Xbox Wireless Adapter & Controller")
+        title_font = QFont()
+        title_font.setPointSize(14)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        header_row.addWidget(title)
+        header_row.addStretch()
+
+        self.dongle_badge = QLabel("Dongle: Checking...")
+        self.dongle_badge.setProperty("class", "BadgeGray")
+        header_row.addWidget(self.dongle_badge)
+        layout.addLayout(header_row)
+
+        # Card 1: Live Controller & Dongle Status
+        status_card = QFrame()
+        status_card.setProperty("class", "Card")
+        s_layout = QVBoxLayout(status_card)
+        s_layout.setContentsMargins(16, 14, 16, 14)
+        s_layout.setSpacing(10)
+
+        sec1 = QLabel("LIVE CONTROLLER STATUS")
+        sec1.setProperty("class", "SectionTitle")
+        s_layout.addWidget(sec1)
+
+        self.empty_title = QLabel("No Controller Connected")
+        self.empty_title.setProperty("class", "BigStatus")
+        s_layout.addWidget(self.empty_title)
+
+        self.empty_sub = QLabel("Press the Xbox button on your controller to connect.")
+        self.empty_sub.setProperty("class", "SubStatus")
+        s_layout.addWidget(self.empty_sub)
+
+        self.slots_container = QVBoxLayout()
+        self.slots_container.setSpacing(8)
+        s_layout.addLayout(self.slots_container)
+
+        btn_row = QHBoxLayout()
+        self.pair_btn = QPushButton("Start Dongle Pairing (60s)")
+        self.pair_btn.setObjectName("GreenBtn")
+        self.pair_btn.clicked.connect(self.toggle_pairing)
+        btn_row.addWidget(self.pair_btn)
+
+        self.poweroff_btn = QPushButton("Turn Off Controller Now")
+        self.poweroff_btn.setObjectName("DangerBtn")
+        self.poweroff_btn.clicked.connect(lambda: self.poweroff_slot("-1"))
+        btn_row.addWidget(self.poweroff_btn)
+        s_layout.addLayout(btn_row)
+
+        layout.addWidget(status_card)
+
+        # Card 2: Idle Auto-Shutoff Timer
+        idle_card = QFrame()
+        idle_card.setProperty("class", "Card")
+        i_layout = QVBoxLayout(idle_card)
+        i_layout.setContentsMargins(16, 14, 16, 14)
+        i_layout.setSpacing(10)
+
+        sec2 = QLabel("IDLE AUTO-SHUTOFF TIMER")
+        sec2.setProperty("class", "SectionTitle")
+        i_layout.addWidget(sec2)
+
+        idle_top = QHBoxLayout()
+        self.idle_chk = QCheckBox("Automatically turn off controller when inactive")
+        self.idle_chk.setChecked(bool(self.cfg.get("idle_enabled", True)))
+        self.idle_chk.toggled.connect(self.on_idle_changed)
+        idle_top.addWidget(self.idle_chk)
+        idle_top.addStretch()
+        i_layout.addLayout(idle_top)
+
+        spin_row = QHBoxLayout()
+        spin_row.addWidget(QLabel("Turn off after:"))
+
+        self.idle_slider = QSlider(Qt.Orientation.Horizontal)
+        self.idle_slider.setRange(1, 60)
+        self.idle_slider.setValue(int(self.cfg.get("idle_timeout_minutes", 15)))
+        self.idle_slider.valueChanged.connect(self.on_idle_slider_changed)
+        spin_row.addWidget(self.idle_slider, 1)
+
+        self.idle_spin = QSpinBox()
+        self.idle_spin.setRange(1, 120)
+        self.idle_spin.setSuffix(" min")
+        self.idle_spin.setValue(int(self.cfg.get("idle_timeout_minutes", 15)))
+        self.idle_spin.valueChanged.connect(self.on_idle_spin_changed)
+        spin_row.addWidget(self.idle_spin)
+        i_layout.addLayout(spin_row)
+
+        self.idle_slider.setEnabled(self.idle_chk.isChecked())
+        self.idle_spin.setEnabled(self.idle_chk.isChecked())
+
+        preset_row = QHBoxLayout()
+        preset_lbl = QLabel("Quick presets:")
+        preset_lbl.setProperty("class", "SubStatus")
+        preset_row.addWidget(preset_lbl)
+        for mins in (5, 10, 15, 20, 30):
+            p_btn = QPushButton(f"{mins}m")
+            p_btn.setObjectName("PresetBtn")
+            p_btn.clicked.connect(lambda checked=False, m=mins: self.set_idle_preset(m))
+            preset_row.addWidget(p_btn)
+        preset_row.addStretch()
+        i_layout.addLayout(preset_row)
+
+        layout.addWidget(idle_card)
+
+        # Card 3: Xbox Guide Button LED
+        led_card = QFrame()
+        led_card.setProperty("class", "Card")
+        l_layout = QVBoxLayout(led_card)
+        l_layout.setContentsMargins(16, 14, 16, 14)
+        l_layout.setSpacing(10)
+
+        sec3 = QLabel("XBOX GUIDE BUTTON LED")
+        sec3.setProperty("class", "SectionTitle")
+        l_layout.addWidget(sec3)
+
+        b_row = QHBoxLayout()
+        b_row.addWidget(QLabel("Brightness:"))
+        self.led_slider = QSlider(Qt.Orientation.Horizontal)
+        self.led_slider.setRange(0, 50)
+        self.led_slider.setValue(int(self.cfg.get("led_brightness", 20)))
+        self.led_slider.valueChanged.connect(self.on_led_changed)
+        b_row.addWidget(self.led_slider, 1)
+
+        self.led_val_label = QLabel(f"{self.led_slider.value()} / 50")
+        self.led_val_label.setMinimumWidth(55)
+        self.led_val_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        b_row.addWidget(self.led_val_label)
+        l_layout.addLayout(b_row)
+
+        m_row = QHBoxLayout()
+        m_row.addWidget(QLabel("LED Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Off (0)", 0)
+        self.mode_combo.addItem("Solid On (1)", 1)
+        self.mode_combo.addItem("Fast Blink (2)", 2)
+        self.mode_combo.addItem("Slow Blink (3)", 3)
+        self.mode_combo.addItem("Breathing / Pulse (4)", 4)
+        saved_mode = int(self.cfg.get("led_mode", 1))
+        idx = self.mode_combo.findData(saved_mode)
+        if idx >= 0:
+            self.mode_combo.setCurrentIndex(idx)
+        self.mode_combo.currentIndexChanged.connect(self.on_led_changed)
+        m_row.addWidget(self.mode_combo, 1)
+        l_layout.addLayout(m_row)
+
+        layout.addWidget(led_card)
+
+        self.setStyleSheet(STYLESHEET)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_status)
+        self.timer.start(1000)
+        self.refresh_status()
+
+    def set_badge_style(self, label, style_class):
+        if label.property("class") != style_class:
+            label.setProperty("class", style_class)
+            label.style().unpolish(label)
+            label.style().polish(label)
+
+    def set_idle_preset(self, minutes):
+        self.idle_chk.setChecked(True)
+        self.idle_spin.setValue(minutes)
+
+    def on_idle_slider_changed(self, val):
+        if self._updating_ui:
+            return
+        self._updating_ui = True
+        self.idle_spin.setValue(val)
+        self._updating_ui = False
+        self.save_settings()
+
+    def on_idle_spin_changed(self, val):
+        if self._updating_ui:
+            return
+        self._updating_ui = True
+        if val <= 60:
+            self.idle_slider.setValue(val)
+        self._updating_ui = False
+        self.save_settings()
+
+    def on_idle_changed(self):
+        if self._updating_ui:
+            return
+        self.idle_slider.setEnabled(self.idle_chk.isChecked())
+        self.idle_spin.setEnabled(self.idle_chk.isChecked())
+        self.save_settings()
+
+    def on_led_changed(self):
+        if self._updating_ui:
+            return
+        b_val = self.led_slider.value()
+        m_val = self.mode_combo.currentData()
+        self.led_val_label.setText(f"{b_val} / 50")
+        self.save_settings()
+
+        for led_dir in glob.glob("/sys/class/leds/gip*:white:status"):
+            write_sysfs(os.path.join(led_dir, "brightness"), b_val)
+            write_sysfs(os.path.join(led_dir, "mode"), m_val)
+
+    def save_settings(self):
+        self.cfg["idle_enabled"] = self.idle_chk.isChecked()
+        self.cfg["idle_timeout_minutes"] = self.idle_spin.value()
+        self.cfg["led_brightness"] = self.led_slider.value()
+        self.cfg["led_mode"] = self.mode_combo.currentData()
+        save_config(self.cfg)
+
+    def toggle_pairing(self):
+        dongle_dir = find_dongle_dir()
+        if not dongle_dir:
+            return
+        p_path = os.path.join(dongle_dir, "pairing")
+        cur = read_sysfs(p_path, "0")
+        write_sysfs(p_path, "0" if cur == "1" else "1")
+        self.refresh_status()
+
+    def poweroff_slot(self, slot_val):
+        dongle_dir = find_dongle_dir()
+        if not dongle_dir:
+            return
+        write_sysfs(os.path.join(dongle_dir, "poweroff"), str(slot_val))
+        self.refresh_status()
+
+    def _clear_slot_rows(self, keep_slots):
+        for slot_str in list(self._slot_rows.keys()):
+            if slot_str not in keep_slots:
+                row = self._slot_rows.pop(slot_str)
+                self.slots_container.removeWidget(row)
+                row.deleteLater()
+
+    def refresh_status(self):
+        dongle_dir = find_dongle_dir()
+        if not dongle_dir:
+            self.dongle_badge.setText("Dongle: Not Found")
+            self.set_badge_style(self.dongle_badge, "BadgeGray")
+            self.pair_btn.setEnabled(False)
+            self.poweroff_btn.setEnabled(False)
+            self._clear_slot_rows(set())
+            self.empty_title.setText("Xbox Wireless Adapter Disconnected")
+            self.empty_title.setVisible(True)
+            self.empty_sub.setText("Plug in your Xbox Wireless Adapter to manage controllers.")
+            self.empty_sub.setVisible(True)
+            return
+
+        self.pair_btn.setEnabled(True)
+        pairing = read_sysfs(os.path.join(dongle_dir, "pairing"), "0") == "1"
+        if pairing:
+            self.dongle_badge.setText("Dongle: Pairing Active")
+            self.set_badge_style(self.dongle_badge, "BadgeBlue")
+            self.pair_btn.setText("Stop Pairing Mode")
+        else:
+            self.dongle_badge.setText("Dongle: Ready")
+            self.set_badge_style(self.dongle_badge, "BadgeGreen")
+            self.pair_btn.setText("Start Dongle Pairing (60s)")
+
+        client_dirs = sorted(glob.glob(os.path.join(dongle_dir, "gip*/gip*.*")))
+        if not client_dirs:
+            self._clear_slot_rows(set())
+            self.empty_title.setText("No Controller Connected")
+            self.empty_title.setVisible(True)
+            self.empty_sub.setText("Press the Xbox button on your controller to connect.")
+            self.empty_sub.setVisible(True)
+            self.poweroff_btn.setEnabled(False)
+            self.poweroff_btn.setText("Turn Off Controller Now")
+            return
+
+        self.empty_title.setVisible(False)
+        self.empty_sub.setVisible(False)
+        self.poweroff_btn.setEnabled(True)
+        multi = len(client_dirs) > 1
+        self.poweroff_btn.setText(
+            "Turn Off All Controllers" if multi else "Turn Off Controller Now"
+        )
+
+        daemon_slots = {}
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                daemon_slots = json.load(f).get("slots", {})
+        except Exception:
+            pass
+
+        active_slots = set()
+        for client_dir in client_dirs:
+            client_name = os.path.basename(client_dir)
+            slot_str = client_name.split(".")[0][3:]
+            active_slots.add(slot_str)
+
+            if slot_str not in self._slot_rows:
+                row = ControllerRow(slot_str, self.poweroff_slot)
+                self._slot_rows[slot_str] = row
+                self.slots_container.addWidget(row)
+
+            batt_level = read_sysfs(
+                os.path.join(client_dir, "power_supply", client_name, "capacity_level"),
+                "Normal",
+            )
+            fw_ver = read_sysfs(os.path.join(client_dir, "firmware_version"), "")
+            fw_suffix = f"  •  FW {fw_ver}" if fw_ver and fw_ver != "0.0.0.0" else ""
+
+            pct_str, badge_style = BATTERY_MAP.get(batt_level, (batt_level, "BadgeGray"))
+
+            idle_text = "Idle timer active"
+            slot_info = daemon_slots.get(slot_str)
+            if slot_info:
+                idle_s = slot_info.get("idle_seconds", 0)
+                rem_s = slot_info.get("remaining_seconds")
+                if rem_s is not None:
+                    idle_text = f"Idle for {format_duration(idle_s)}  •  Auto-off in {format_duration(rem_s)}"
+                else:
+                    idle_text = f"Idle for {format_duration(idle_s)}  •  Auto-off disabled"
+
+            self._slot_rows[slot_str].update_info(
+                f"Xbox Wireless Controller (Slot {slot_str}){fw_suffix}",
+                f"Battery: {pct_str}",
+                badge_style,
+                idle_text,
+                multi,
+            )
+
+        self._clear_slot_rows(active_slots)
+
+
+def main():
+    app = QApplication(sys.argv)
+    win = XoneControlWindow()
+    win.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+# Maintainer: Zach9113 <130371506+Zach9113@users.noreply.github.com>
+pkgname=xone-control
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="Desktop manager and idle auto-shutoff daemon for Xbox Wireless Adapters using the Linux xone driver"
+arch=('any')
+url="https://github.com/Zach9113/xone-control"
+license=('GPL-3.0-or-later')
+depends=('python' 'pyside6')
+optdepends=('xone-dkms: Linux kernel driver for Xbox Wireless Adapters')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Zach9113/$pkgname/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+
+    install -Dm755 bin/xone-control "$pkgdir/usr/bin/xone-control"
+    install -Dm755 bin/xone-control-daemon "$pkgdir/usr/bin/xone-control-daemon"
+    install -Dm644 desktop/xone-control.desktop "$pkgdir/usr/share/applications/xone-control.desktop"
+    install -Dm644 udev/99-xone-user-permissions.rules "$pkgdir/usr/lib/udev/rules.d/99-xone-user-permissions.rules"
+
+    sed 's|%h/.local/bin/xone-control-daemon|/usr/bin/xone-control-daemon|' \
+        systemd/xone-control.service > "$srcdir/xone-control.service"
+    install -Dm644 "$srcdir/xone-control.service" "$pkgdir/usr/lib/systemd/user/xone-control.service"
+}

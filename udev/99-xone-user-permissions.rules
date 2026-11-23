@@ -1,0 +1,3 @@
+# Allow users in the 'input' group to control xone-dongle pairing/poweroff and Xbox controller LEDs
+SUBSYSTEM=="usb", DRIVER=="xone-dongle", RUN+="/bin/sh -c 'chgrp input /sys%p/pairing /sys%p/poweroff 2>/dev/null; chmod 0664 /sys%p/pairing /sys%p/poweroff 2>/dev/null'"
+SUBSYSTEM=="leds", KERNEL=="gip*:white:status", RUN+="/bin/sh -c 'chgrp input /sys%p/brightness /sys%p/mode 2>/dev/null; chmod 0664 /sys%p/brightness /sys%p/mode 2>/dev/null'"

@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+xone-control-daemon — Background idle auto-shutoff & LED manager for Linux xone wireless controllers.
+License: GPL-3.0-or-later
+"""
+
+import glob
+import json
+import os
+import select
+import struct
+import time
+
+CONFIG_DIR = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+    "xone-control",
+)
+CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+STATE_PATH = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+    "xone-control-state.json",
+)
+
+DEFAULT_CONFIG = {
+    "idle_enabled": True,
+    "idle_timeout_minutes": 15,
+    "led_brightness": 20,
+    "led_mode": 1,
+}
+
+# struct input_event on 64-bit Linux: timeval (q, q), type (H), code (H), value (i)
+INPUT_EVENT_STRUCT = struct.Struct("qqHHi")
+
+EV_KEY = 0x01
+EV_ABS = 0x03
+
+# Deadzone thresholds so slight stick drift doesn't reset the idle timer
+STICK_DEADZONE_DELTA = 1800
+TRIGGER_DEADZONE_DELTA = 35
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            cfg = dict(DEFAULT_CONFIG)
+            cfg.update(data)
+            return cfg
+    except Exception:
+        return dict(DEFAULT_CONFIG)
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
+
+
+def find_dongle_dir():
+    matches = sorted(glob.glob("/sys/bus/usb/drivers/xone-dongle/*:1.0"))
+    return matches[0] if matches else None
+
+
+def find_controllers(dongle_dir):
+    if not dongle_dir:
+        return {}
+    controllers = {}
+    for gip_dir in sorted(glob.glob(os.path.join(dongle_dir, "gip*"))):
+        base = os.path.basename(gip_dir)
+        if not base[3:].isdigit():
+            continue
+        idx = int(base[3:])
+        client_dirs = sorted(glob.glob(os.path.join(gip_dir, f"{base}.*")))
+        if not client_dirs:
+            continue
+        client_dir = client_dirs[0]
+        client_name = os.path.basename(client_dir)
+
+        ev_dirs = glob.glob(os.path.join(client_dir, "input/input*/event*"))
+        ev_dev = None
+        if ev_dirs:
+            ev_name = os.path.basename(ev_dirs[0])
+            candidate = f"/dev/input/{ev_name}"
+            if os.path.exists(candidate):
+                ev_dev = candidate
+
+        led_dir = os.path.join(client_dir, "leds", f"{client_name}:white:status")
+        batt_dir = os.path.join(client_dir, "power_supply", client_name)
+
+        controllers[idx] = {
+            "slot": idx,
+            "gip_name": base,
+            "client_name": client_name,
+            "client_dir": client_dir,
+            "event_dev": ev_dev,
+            "led_dir": led_dir if os.path.isdir(led_dir) else None,
+            "batt_dir": batt_dir if os.path.isdir(batt_dir) else None,
+        }
+    return controllers
+
+
+def apply_led(ctrl, brightness, mode):
+    led_dir = ctrl.get("led_dir")
+    if not led_dir:
+        return
+    try:
+        with open(os.path.join(led_dir, "brightness"), "w", encoding="utf-8") as f:
+            f.write(str(int(brightness)))
+        with open(os.path.join(led_dir, "mode"), "w", encoding="utf-8") as f:
+            f.write(str(int(mode)))
+    except Exception:
+        pass
+
+
+def poweroff_slot(dongle_dir, slot):
+    if not dongle_dir:
+        return False
+    try:
+        with open(os.path.join(dongle_dir, "poweroff"), "w", encoding="utf-8") as f:
+            f.write(str(int(slot)))
+        return True
+    except Exception:
+        return False
+
+
+def main():
+    if not os.path.exists(CONFIG_PATH):
+        save_config(DEFAULT_CONFIG)
+
+    last_cfg_mtime = 0
+    cfg = load_config()
+    tracked = {}
+
+    while True:
+        now = time.time()
+
+        try:
+            mtime = os.path.getmtime(CONFIG_PATH)
+            if mtime != last_cfg_mtime:
+                cfg = load_config()
+                last_cfg_mtime = mtime
+                for slot_info in tracked.values():
+                    slot_info["led_applied"] = False
+        except Exception:
+            pass
+
+        dongle_dir = find_dongle_dir()
+        controllers = find_controllers(dongle_dir)
+
+        for slot in list(tracked.keys()):
+            if slot not in controllers or tracked[slot]["event_dev"] != controllers[slot]["event_dev"]:
+                fd = tracked[slot].get("fd")
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                del tracked[slot]
+
+        for slot, ctrl in controllers.items():
+            if slot not in tracked:
+                fd = None
+                ev_dev = ctrl.get("event_dev")
+                if ev_dev:
+                    try:
+                        fd = os.open(ev_dev, os.O_RDONLY | os.O_NONBLOCK)
+                    except Exception:
+                        fd = None
+                tracked[slot] = {
+                    "fd": fd,
+                    "event_dev": ev_dev,
+                    "last_active": now,
+                    "axes": {},
+                    "led_applied": False,
+                }
+            if not tracked[slot]["led_applied"] and ctrl.get("led_dir"):
+                apply_led(ctrl, cfg.get("led_brightness", 20), cfg.get("led_mode", 1))
+                tracked[slot]["led_applied"] = True
+
+        fd_to_slot = {info["fd"]: slot for slot, info in tracked.items() if info["fd"] is not None}
+        if fd_to_slot:
+            try:
+                rlist, _, _ = select.select(list(fd_to_slot.keys()), [], [], 1.0)
+            except Exception:
+                rlist = []
+
+            now = time.time()
+            for fd in rlist:
+                slot = fd_to_slot.get(fd)
+                if slot is None or slot not in tracked:
+                    continue
+                t_info = tracked[slot]
+                try:
+                    data = os.read(fd, INPUT_EVENT_STRUCT.size * 64)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    try:
+                        os.close(fd)
+                    except Exception:
+                        pass
+                    t_info["fd"] = None
+                    continue
+
+                offset = 0
+                meaningful = False
+                while offset + INPUT_EVENT_STRUCT.size <= len(data):
+                    _, _, ev_type, ev_code, ev_val = INPUT_EVENT_STRUCT.unpack_from(data, offset)
+                    offset += INPUT_EVENT_STRUCT.size
+                    if ev_type == EV_KEY and ev_val != 0:
+                        meaningful = True
+                    elif ev_type == EV_ABS:
+                        if ev_code in (16, 17):
+                            if ev_val != 0:
+                                meaningful = True
+                        elif ev_code in (2, 5):
+                            if ev_val > TRIGGER_DEADZONE_DELTA:
+                                meaningful = True
+                        else:
+                            prev = t_info["axes"].get(ev_code, ev_val)
+                            if abs(ev_val - prev) > STICK_DEADZONE_DELTA or abs(ev_val) > 6500:
+                                meaningful = True
+                            t_info["axes"][ev_code] = ev_val
+
+                if meaningful:
+                    t_info["last_active"] = now
+        else:
+            time.sleep(1.5)
+
+        now = time.time()
+        timeout_sec = max(1, int(cfg.get("idle_timeout_minutes", 15))) * 60
+        idle_enabled = bool(cfg.get("idle_enabled", True))
+
+        state_slots = {}
+        for slot, t_info in list(tracked.items()):
+            idle_sec = max(0, int(now - t_info["last_active"]))
+            rem_sec = max(0, timeout_sec - idle_sec) if idle_enabled else None
+            state_slots[str(slot)] = {
+                "idle_seconds": idle_sec,
+                "remaining_seconds": rem_sec,
+            }
+            if idle_enabled and idle_sec >= timeout_sec:
+                if poweroff_slot(dongle_dir, slot):
+                    t_info["last_active"] = now
+
+        try:
+            tmp_state = STATE_PATH + ".tmp"
+            with open(tmp_state, "w", encoding="utf-8") as f:
+                json.dump({"updated": now, "slots": state_slots}, f)
+            os.replace(tmp_state, STATE_PATH)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

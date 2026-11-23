@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Xbox Wireless Controller Manager
+Comment=Configure Xbox controller idle auto-shutoff timer, Guide LED brightness, and dongle pairing
+Exec=xone-control
+Icon=input-gaming
+Terminal=false
+Type=Application
+Categories=Settings;HardwareSettings;Game;
+Keywords=xbox;xone;controller;gamepad;idle;dongle;
