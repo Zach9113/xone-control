@@ -9,6 +9,7 @@ license=('GPL-3.0-or-later')
 depends=('python' 'pyside6')
 optdepends=(
     'xone-dkms: Linux kernel driver for Xbox Wireless Adapters'
+    'xpadneo-dkms: Advanced Linux Bluetooth driver for Xbox controllers'
     'bluez-utils: bluetoothctl for disconnecting idle Bluetooth Xbox controllers'
 )
 source=("$pkgname-$pkgver.tar.gz::https://github.com/Zach9113/$pkgname/archive/refs/tags/v$pkgver.tar.gz")

@@ -1,11 +1,11 @@
 # xone-control
 
-A lightweight Linux desktop manager and background idle auto-shutoff daemon for **Xbox Wireless Controllers** — supporting both **Xbox Wireless Adapters** (via [`xone`](https://github.com/dlundqvist/xone)) and **Bluetooth** (`xpadneo` or stock Linux BlueZ HID).
+A lightweight Linux desktop manager and background idle auto-shutoff daemon for **Xbox Wireless Controllers** — supporting both **Xbox Wireless Adapters** (via [`xone`](https://github.com/dlundqvist/xone)) and **Bluetooth** ([`xpadneo`](https://github.com/atar-axis/xpadneo) or stock Linux BlueZ HID).
 
 > [!IMPORTANT]
 > **Driver note:**
 > - **Xbox Wireless Adapter (USB dongle):** Requires the [`xone`](https://github.com/dlundqvist/xone) Linux kernel driver (`xone-dongle` + `xone-gip-gamepad`) already installed. This is a companion app and does not include the driver itself.
-> - **Bluetooth:** Works out of the box with `bluez` (`bluetoothctl`) using either `xpadneo` or the stock Linux Bluetooth driver. *(Note: Xbox Guide LED brightness/mode and dongle pairing are hardware-limited to the `xone` USB dongle.)*
+> - **Bluetooth:** Works out of the box with `bluez` (`bluetoothctl`) using either [`xpadneo`](https://github.com/atar-axis/xpadneo) (recommended for Bluetooth) or the stock Linux Bluetooth driver. *(Note: Xbox Guide LED brightness/mode and dongle pairing are hardware-limited to the `xone` USB dongle.)*
 
 ## Features
 
